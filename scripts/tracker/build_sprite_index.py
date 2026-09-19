@@ -19,6 +19,7 @@ from typing import Any
 
 from common import (
     GITHUB_BASE_URL,
+    KNOWN_SPRITE_EXCLUSION_RULES,
     PROJECT_ROOT,
     SPRITES_DIR,
     UNIFIED_VERSION_GROUPS,
@@ -32,6 +33,7 @@ from common import (
 reconfigure_utf8()
 
 WEBSITE_DATA_DIR = WEBSITE_DIR / "data"
+
 
 def load_pokeapi_game_metadata() -> tuple[
     dict[str, str],
@@ -214,6 +216,8 @@ def get_subcategory(subpath: str) -> str:
     if not subpath:
         return "Default"
     parts = set(subpath.split("/"))
+    if "icons" in parts:
+        return "Icons"
     if "animated" in parts:
         return "Animated"
     if "transparent" in parts and "gray" in parts:
@@ -364,6 +368,58 @@ def build_index(output_file: Path | None = None) -> Path:
             game_poke_sets.setdefault("black-white", set()).update(game_poke_sets["black-2-white-2"])
         if "sun-moon" in game_poke_sets:
             game_poke_sets.setdefault("ultra-sun-ultra-moon", set()).update(game_poke_sets["sun-moon"])
+
+        # Override lets-go-pikachu-lets-go-eevee game indices using pokedex_id 26 (letsgo-kanto)
+        # to fix PokéAPI's faulty pokemon_game_indices.csv (which contains dummy entries 1..802 up to Marshadow)
+        try:
+            pdx_vg_rows = load_csv(f"{GITHUB_BASE_URL}/pokedex_version_groups.csv")
+            pdx_num_rows = load_csv(f"{GITHUB_BASE_URL}/pokemon_dex_numbers.csv")
+            lgpe_pdx_ids = {r["pokedex_id"] for r in pdx_vg_rows if r.get("version_group_id") == "19"}
+            if lgpe_pdx_ids:
+                sp_to_pk = {r["species_id"]: int(r["id"]) for r in df_pk if r.get("is_default") == "1"}
+                lgpe_sp_ids = {r["species_id"] for r in pdx_num_rows if r.get("pokedex_id") in lgpe_pdx_ids}
+                lgpe_pks = {sp_to_pk[sp] for sp in lgpe_sp_ids if sp in sp_to_pk}
+                if lgpe_pks:
+                    game_poke_sets["lets-go-pikachu-lets-go-eevee"] = lgpe_pks
+        except Exception as ex_lgpe:
+            print(f"[WARN] Failed to override LGPE pokedex indices ({ex_lgpe})")
+
+        # Expand game indices to include valid 10k+ varieties (Megas, regional forms, battle forms)
+        # whose species is present in that game and whose forms were introduced in or before that version group.
+        vg_order_map = {r["id"]: int(r.get("order", 0)) for r in vg_rows}
+        pk_by_id_map = {int(r["id"]): r for r in df_pk}
+        forms_by_pk_id = defaultdict(list)
+        for f in df_forms:
+            forms_by_pk_id[int(f["pokemon_id"])].append(f)
+
+        for vg_id, vg_key in vg_ident_map.items():
+            cur_order = vg_order_map.get(vg_id, 0)
+            current_set = game_poke_sets.get(vg_key, set())
+            if not current_set:
+                continue
+            base_species = {int(pk_by_id_map[pid]["species_id"]) for pid in current_set if pid in pk_by_id_map}
+
+            for pid, p in pk_by_id_map.items():
+                if pid < 10000:
+                    continue
+                sid = int(p["species_id"])
+                if sid not in base_species:
+                    continue
+                p_forms = forms_by_pk_id.get(pid, [])
+                is_valid = False
+                if not p_forms:
+                    is_valid = True
+                else:
+                    for f in p_forms:
+                        intro = f.get("introduced_in_version_group_id")
+                        if not intro:
+                            is_valid = True
+                            break
+                        if vg_order_map.get(intro, 999) <= cur_order:
+                            is_valid = True
+                            break
+                if is_valid:
+                    current_set.add(pid)
 
         game_indices = {k: sorted(list(v)) for k, v in game_poke_sets.items()}
     except Exception as e:
@@ -780,6 +836,8 @@ def build_index(output_file: Path | None = None) -> Path:
         "types_dict": types_dict,
         "types_list": types_list,
         "game_indices": game_indices,
+        # Rule-based exclusion list — frontend evaluates per-game using max_gen / only_games
+        "known_sprite_exclusion_rules": KNOWN_SPRITE_EXCLUSION_RULES,
     }
 
     with open(dest, "w", encoding="utf-8") as f:
